@@ -1,5 +1,11 @@
 
 
+**Context & Mission:**
+You are an expert quantitative developer and Python algorithmic trading engineer. I have a highly optimized, NumPy-based OHLC trading engine (`trading_engine.py`) that serves as the core filter for MT5 strategy screening. It currently handles market orders, gap-aware fills, and pessimistic stop-loss checks inside a fast array iteration loop (`apply_sl_tp_and_costs`). 
+
+I need you to upgrade this engine to support a much wider variety of institutional and retail trading mechanics. Your goal is to implement the following features into the execution logic while maintaining maximum performance .
+
+Please implement the following architectural upgrades:
 
 ### 1. Advanced Entry Mechanics
 *   **Pending Orders (Limit and Stop Entries):**
@@ -41,10 +47,10 @@
     *   **What:** Applying different overnight costs depending on whether the trade is long or short.
     *   **Why:** In equities and some commodities, shorting costs significantly more than going long (borrow fees). Even in Forex, broker swap rates are highly asymmetrical (e.g., holding Long USDTRY pays you, holding Short USDTRY drains your account instantly). If you trade daily charts, this will destroy theoretical edges.
 
+**Phase 2: Update the Prompt Documentation**
+Once you have successfully upgraded `trading_engine.py` (and any necessary helper functions in `quant_toolbox.py`), thoroughly UPDATE `STRATEGY_GENERATOR_PROMPT.md` to be fully aligned with the new engine. 
 
-
-
-
-
-
-UPDATE STRATEGY_GENERATOR_PROMPT.md to be aligned with the new engine .
+Make sure the updated Markdown file:
+1. Explains to the Strategy Generating AI how to utilize the new features (e.g., how to pass limit orders, dynamic SL arrays, or fractional position sizes).
+2. Updates the "WHAT THIS FRAMEWORK CANNOT DO" section (removing things that are now supported).
+3. Updates the `API REFERENCE` section with the new function signatures and capabilities.
