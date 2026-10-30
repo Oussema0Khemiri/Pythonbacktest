@@ -117,6 +117,9 @@ def calculate_dynamic_position_size(df, account_balance=10000, risk_pct=0.01, at
     
     contract_size should be pulled from MT5: mt5.symbol_info(sym).trade_contract_size
     Examples: Forex = 100000, Gold = 100, Indices = 1
+
+    For BACKTESTS use the engine's sizing="risk" instead (it sizes off the real stop distance and the
+    compounding equity); this helper only gives indicative live lot sizes.
     """
     # Example: Risking 1% of $10,000 = $100 per trade.
     risk_amount = account_balance * risk_pct
@@ -133,24 +136,56 @@ def calculate_dynamic_position_size(df, account_balance=10000, risk_pct=0.01, at
 STOP_MODES  = ["none", "fixed", "trail"]     # restrict per run, e.g. ["trail"] or ["none", "fixed"]
 FIXED_RANGE = (1.0, 20.0)                    # fixed stop distance, in ATR multiples
 TRAIL_RANGE = (1.0, 20.0)                    # trailing stop distance, in ATR multiples
+# Optional trade-management searches. None = OFF (not searched, engine default). Set a (low, high)
+# tuple to search it together with the stop, e.g. qt.BE_RANGE = (0.5, 3.0). low == high fixes it.
+BE_RANGE        = None                       # move stop to breakeven after this profit, in ATR multiples
+TP_RANGE        = None                       # final take-profit distance, in ATR multiples
+TP1_RANGE       = None                       # partial take-profit (scale-out) distance, in ATR multiples
+TIME_STOP_RANGE = None                       # time stop: close a layer after this many bars (ints)
 
 def get_ref_atr(train_df, period=14):
     """IN-SAMPLE median ATR in price units. Compute once on train_df and reuse for IS and OOS."""
     atr = add_atr(train_df.copy(), period)[f'ATR_{period}']
     return float(atr.median())
 
+_MGMT_KEYS = ("be_mult", "tp_mult", "tp1_mult", "max_bars")
+
+def _suggest_range(trial, name, rng, integer=False):
+    lo, hi = rng
+    if lo == hi:
+        return int(lo) if integer else float(lo)
+    if integer:
+        return trial.suggest_int(name, int(lo), int(hi), log=True)
+    return trial.suggest_float(name, lo, hi, log=True)
+
 def suggest_stop_params(trial, modes=STOP_MODES):
-    """Returns {'mode': str, 'mult': float}. mult is in ATR multiples (0 for 'none')."""
+    """
+    Returns {'mode', 'mult', 'be_mult', 'tp_mult', 'tp1_mult', 'max_bars'}. mult / *_mult are ATR
+    multiples (0 = off), max_bars is bars (0 = off). The management keys are only searched when their
+    module-level *_RANGE is set (read at call time, so qt.BE_RANGE = (...) in the notebook works).
+    """
     mode = trial.suggest_categorical("stop_mode", modes)
     mult = 0.0
     if mode == "fixed":
         mult = trial.suggest_float("sl_mult", *FIXED_RANGE, log=True)
     elif mode == "trail":
         mult = trial.suggest_float("trail_mult", *TRAIL_RANGE, log=True)
-    return {"mode": mode, "mult": mult}
+    stop = {"mode": mode, "mult": mult, "be_mult": 0.0, "tp_mult": 0.0, "tp1_mult": 0.0, "max_bars": 0}
+    if BE_RANGE is not None:
+        stop["be_mult"] = _suggest_range(trial, "be_mult", BE_RANGE)
+    if TP_RANGE is not None:
+        stop["tp_mult"] = _suggest_range(trial, "tp_mult", TP_RANGE)
+    if TP1_RANGE is not None:
+        stop["tp1_mult"] = _suggest_range(trial, "tp1_mult", TP1_RANGE)
+    if TIME_STOP_RANGE is not None:
+        stop["max_bars"] = _suggest_range(trial, "max_bars", TIME_STOP_RANGE, integer=True)
+    return stop
 
 def stop_from_params(best):
-    """Rebuild the stop dict from study.best_params (flat dict)."""
+    """
+    Rebuild the stop dict from study.best_params (flat dict). A range fixed with low == high is not
+    an Optuna param, so it is read back from the current *_RANGE setting.
+    """
     mode = best["stop_mode"]
     if mode == "fixed":
         mult = best.get("sl_mult", 0.0)
@@ -158,21 +193,36 @@ def stop_from_params(best):
         mult = best.get("trail_mult", 0.0)
     else:
         mult = 0.0
-    return {"mode": mode, "mult": mult}
+    stop = {"mode": mode, "mult": mult}
+    for key, rng in zip(_MGMT_KEYS, (BE_RANGE, TP_RANGE, TP1_RANGE, TIME_STOP_RANGE)):
+        default = (rng[0] if rng is not None and rng[0] == rng[1] else 0)
+        stop[key] = best.get(key, default)
+    stop["max_bars"] = int(stop["max_bars"])
+    return stop
 
 def stop_to_points(stop, ref_atr, point_size):
-    """Stop dict -> engine kwargs (sl_points / tp_points / trail_points)."""
+    """
+    Stop dict -> engine kwargs. sl_points / trail_points are always returned; the management kwargs
+    (tp_points, be_trigger_points, tp1_points, max_bars) only when switched on, so the same setting
+    can instead be fixed through engine_kw (giving it both ways raises a TypeError).
+    """
     pts = stop["mult"] * ref_atr / point_size if stop["mult"] > 0 else 0.0
-    return {"sl_points": pts if stop["mode"] == "fixed" else 0,
-            "tp_points": 0,
-            "trail_points": pts if stop["mode"] == "trail" else 0}
+    kw = {"sl_points": pts if stop["mode"] == "fixed" else 0,
+          "trail_points": pts if stop["mode"] == "trail" else 0}
+    to_pts = lambda m: m * ref_atr / point_size
+    if stop.get("tp_mult", 0) > 0:  kw["tp_points"] = to_pts(stop["tp_mult"])
+    if stop.get("be_mult", 0) > 0:  kw["be_trigger_points"] = to_pts(stop["be_mult"])
+    if stop.get("tp1_mult", 0) > 0: kw["tp1_points"] = to_pts(stop["tp1_mult"])
+    if stop.get("max_bars", 0) > 0: kw["max_bars"] = int(stop["max_bars"])
+    return kw
 
 def run_backtest(df, pos, point_size, spread_pts, ref_atr, stop, **engine_kw):
     """
     Every mode goes through apply_sl_tp_and_costs, so none / fixed / trail share identical
     entry, spread and gap conventions and can be compared fairly.
     ref_atr must be the IN-SAMPLE median ATR (same value for IS and OOS) -> no leakage.
-    engine_kw passes optional costs straight to the engine (slippage_points, swap_pct_per_night).
+    engine_kw passes any other engine setting straight through (slippage_points, swap, sizing,
+    risk_pct, max_leverage, max_layers, tp1_fraction, ..., return_trades=True for a trade log).
     """
     return apply_sl_tp_and_costs(df, pos, point_size, spread_pts,
                                  **stop_to_points(stop, ref_atr, point_size), **engine_kw)
@@ -218,6 +268,8 @@ def fit_strategy(train_df, point_size, spread_pts, signal_fn, space_fn, map_fn, 
     Returns dict(params, stop, fitness, ref_atr, group_scores) or None if nothing could run.
     """
     engine_kw = engine_kw or {}
+    if verbose and engine_kw.get("sizing") == "risk" and "none" in stop_modes:
+        print("  note: sizing='risk' needs a stop; 'none' trials only run if the strategy supplies sl_price")
     ref_atr = get_ref_atr(train_df)
     if not np.isfinite(ref_atr) or ref_atr <= 0:
         if verbose: print("  skip: invalid ATR")
@@ -243,6 +295,24 @@ def fit_strategy(train_df, point_size, spread_pts, signal_fn, space_fn, map_fn, 
 # =====================================================================
 # MODULE 7: COST STRESS (same positions + stops, harsher costs)
 # =====================================================================
+def get_swap_pcts(info, ref_price, default=0.0002, allow_credit=False):
+    """
+    Per-direction overnight swap as fractions of price per night: (long, short). Positive = you pay.
+    Same conversion rules as get_swap_pct. allow_credit=False (default, conservative) turns a swap
+    that would PAY you into 0; True keeps it as a negative cost (today's rate applied to all history).
+    Pass them to the engine as swap_long_pct_per_night / swap_short_pct_per_night.
+    """
+    mode = getattr(info, "swap_mode", None)
+    if mode == 0:
+        return 0.0, 0.0
+    if mode == 1:
+        conv = float(info.point) / float(ref_price)
+        long_cost, short_cost = -float(info.swap_long) * conv, -float(info.swap_short) * conv
+        if not allow_credit:
+            long_cost, short_cost = max(0.0, long_cost), max(0.0, short_cost)
+        return long_cost, short_cost
+    return default, default
+
 def get_swap_pct(info, ref_price, default=0.0002):
     """
     Worst-case overnight swap as a fraction of price per night, from MT5 symbol_info.
@@ -259,15 +329,20 @@ def get_swap_pct(info, ref_price, default=0.0002):
     return default
 
 def stress_test(df, pos, point_size, spread_pts, ref_atr, stop, swap_pct_per_night=0.0002,
-                scenarios=None, mc_sims=100):
+                scenarios=None, mc_sims=100, swap_long_pct_per_night=None, swap_short_pct_per_night=None,
+                engine_kw=None):
     """
     Re-run the SAME positions and stop under harsher costs (spread x1.5/x2/x3, slippage, overnight
     swap, and a combined 'harsh' case). Returns (table, summary). summary['survives_stress'] is True
     only if CAGR stays positive in EVERY scenario.
+    Directional swaps (from get_swap_pcts) replace swap_pct_per_night when given. engine_kw must be the
+    same non-cost engine settings used for the backtest (sizing, layers, ...), without swap/slippage.
     """
     table = _engine_cost_stress(df, pos, point_size, spread_pts,
                                 swap_pct_per_night=swap_pct_per_night, scenarios=scenarios,
-                                mc_simulations=mc_sims, **stop_to_points(stop, ref_atr, point_size))
+                                mc_simulations=mc_sims, swap_long_pct_per_night=swap_long_pct_per_night,
+                                swap_short_pct_per_night=swap_short_pct_per_night,
+                                **stop_to_points(stop, ref_atr, point_size), **(engine_kw or {}))
     summary = {"stress_worst_cagr": float(table["cagr"].min()),
                "stress_cagr_harsh": float(table["cagr"].iloc[-1]),
                "survives_stress": bool(table["survives"].all())}
@@ -320,6 +395,7 @@ def walk_forward(df, fit_fn, signal_fn, map_fn, point_size, spread_pts, n_folds=
             "variant": res["params"].get("variant") if viable else None,
             "stop_mode": res["stop"]["mode"] if viable else None,
             "stop_mult": res["stop"]["mult"] if viable else np.nan,
+            "stop": res["stop"] if viable else None,
             "is_fitness": res["fitness"] if res is not None else np.nan,
             "oos_return": float((1 + net).prod() - 1),
             "oos_sharpe": m["sharpe"] if m else np.nan,
